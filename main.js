@@ -78,6 +78,7 @@ function drawText(tokens, exact, curOp, settings) {
 
   let prevChar = '';
   let pIdx = 0;
+  let focusRendered = false;
 
 
   for (const tok of tokens) {
@@ -98,7 +99,16 @@ function drawText(tokens, exact, curOp, settings) {
     const active = isActive(tok, pIdx);
 
 
+    // Если это удаленный токен и подсветка выключена
     if (tok.st === 'del' && !active) {
+      // Если это текущая правка — ставим невидимый якорь для автоскролла
+      if (!exact && tok.op === curOp && !focusRendered) {
+        const anchor = document.createElement('span');
+        anchor.className = 'token focus';
+        anchor.style.cssText = 'display:inline-block;width:0;height:0;overflow:hidden;vertical-align:baseline;';
+        pEl.appendChild(anchor);
+        focusRendered = true;
+      }
       continue;
     }
 
@@ -114,16 +124,17 @@ function drawText(tokens, exact, curOp, settings) {
 
     span.textContent = tok.v;
 
-
-    const focusAllowed =
-      (mode !== 'off') && !exact;
-
+    // Фокус для автоскролла ставится ВСЕГДА, независимо от режима подсветки
+    const isFocus = !exact && tok.op === curOp;
+    if (isFocus) {
+      focusRendered = true;
+    }
 
     span.className =
       'token'
       + (active && tok.st === 'ins' ? ' ins' : '')
       + (active && tok.st === 'del' ? ' del' : '')
-      + (focusAllowed && tok.op === curOp ? ' focus' : '');
+      + (isFocus ? ' focus' : '');
 
 
     pEl.appendChild(span);
@@ -145,48 +156,6 @@ function escapeHTML(value) {
     .replaceAll("'", '&#039;');
 }
 
-
-function renderEdgeLabel(el, v) {
-  if (!el) return;
-
-
-  if (!v) {
-    el.innerHTML = '';
-    el.style.visibility = 'hidden';
-    el.removeAttribute('title');
-
-    return;
-  }
-
-
-  const tipLines = [
-    `${v.id}`,
-    `${v.title}`,
-    v.date ? `Дата: ${v.date}` : '',
-    v.note ? `Прим.: ${v.note}` : ''
-  ].filter(Boolean);
-
-
-  const tip = tipLines.join('\n');
-
-
-  el.style.visibility = 'visible';
-
-  el.innerHTML = `
-    <span
-      class="edge-pill"
-      title="${escapeHTML(tip)}"
-    >
-      <span class="id">
-        ${escapeHTML(v.id)}
-      </span>
-
-      <span class="edge-pill-text">
-        ${escapeHTML(v.title)}${v.date ? ` · ${escapeHTML(v.date)}` : ''}
-      </span>
-    </span>
-  `;
-}
 
 
 /* MOBILE GRAPH */
@@ -747,537 +716,375 @@ function saveSettings(st) {
 
 /* APP */
 
-async function load() {
+function buildPillHTML(v) {
+  if (!v) return '';
 
-  const data =
-    window.TXTS_INLINE
-      ? window.TXTS_INLINE
-      : await (
-          await fetch('./txts.json')
-        ).json();
+  const tipLines = [
+    `${v.id}`,
+    `${v.title}`,
+    v.date ? `Дата: ${v.date}` : '',
+    v.note ? `Прим.: ${v.note}` : ''
+  ].filter(Boolean);
 
+  const tip = tipLines.join('\n');
 
-  document.getElementById('title').textContent =
-    data.meta.work;
+  return `
+    <span class="edge-pill" title="${escapeHTML(tip)}">
+      <span class="id">${escapeHTML(v.id)}</span>
+      <span class="edge-pill-text">
+        ${escapeHTML(v.title)}${v.date ? ` · ${escapeHTML(v.date)}` : ''}
+      </span>
+    </span>
+  `;
+}
 
+// Умная функция автопрокрутки
+function smartScrollToToken(focusEl, smooth = false) {
+  if (!focusEl) return;
 
-  document.getElementById('part').textContent =
-    data.meta.part;
+  const stickyHost = document.querySelector('.sticky-host');
+  const stickyHeight = stickyHost ? stickyHost.getBoundingClientRect().height : 0;
 
+  const rect = focusEl.getBoundingClientRect();
+  const viewH = window.innerHeight;
 
-  document.getElementById('srcNote').textContent =
-    data.meta.src;
+  const topComfort = stickyHeight + 60;
+  const bottomComfort = viewH - 80;
 
+  if (rect.top >= topComfort && rect.bottom <= bottomComfort) {
+    return;
+  }
 
-  document.getElementById('methodNote').textContent =
-    data.meta.note;
+  const availableH = viewH - stickyHeight;
+  const targetY = window.scrollY + rect.top - stickyHeight - (availableH / 2) + (rect.height / 2);
 
+  window.scrollTo({
+    top: Math.max(0, targetY),
+    behavior: smooth ? 'smooth' : 'auto'
+  });
+}
 
-  document.getElementById('projectName').textContent =
-    data.meta.work;
+// ГЛОБАЛЬНАЯ ИНИЦИАЛИЗАЦИЯ ПРИЛОЖЕНИЯ
+async function boot() {
+  
+  // Глобальные переменные текущего открытого проекта
+  let currentPlayer = null;
+  let currentRender = null;
+  let currentState = null;
+  let graphMap = null;
 
-
-  document.getElementById('partName').textContent =
-    data.meta.part;
-
-
-  const graph =
-    buildGraphIndex(data);
-
-
-  let lastState = null;
-  let lastAutoKey = null;
-
-
+  // --- НАСТРОЙКИ ---
   const settings = {
     highlightMode: 'doc',
     fontSize: 17,
-    autoScroll: false
+    autoScroll: true
   };
 
+  Object.assign(settings, loadSettings() || {});
 
-  Object.assign(
-    settings,
-    loadSettings() || {}
-  );
+  document.documentElement.style.setProperty('--textSize', settings.fontSize + 'px');
 
-
-  document.documentElement.style.setProperty(
-    '--textSize',
-    settings.fontSize + 'px'
-  );
-
-
-  const settingsBtn =
-    document.getElementById(
-      'settingsBtn'
-    );
-
-
-  const settingsPanel =
-    document.getElementById(
-      'settingsPanel'
-    );
-
-
-  const fontMinus =
-    document.getElementById(
-      'fontMinus'
-    );
-
-
-  const fontPlus =
-    document.getElementById(
-      'fontPlus'
-    );
-
-
-  const fontValue =
-    document.getElementById(
-      'fontValue'
-    );
-
-
-  const autoScrollEl =
-    document.getElementById(
-      'autoScroll'
-    );
-
+  const settingsBtn = document.getElementById('settingsBtn');
+  const settingsPanel = document.getElementById('settingsPanel');
+  const fontMinus = document.getElementById('fontMinus');
+  const fontPlus = document.getElementById('fontPlus');
+  const fontValue = document.getElementById('fontValue');
+  const autoScrollEl = document.getElementById('autoScroll');
 
   function updateSettingsUI() {
-
     if (!settingsPanel) return;
-
-
-    settingsPanel
-      .querySelectorAll(
-        'input[type="radio"][name="hl"]'
-      )
-      .forEach(r => {
-        r.checked =
-          r.value ===
-          settings.highlightMode;
-      });
-
-
-    if (autoScrollEl) {
-      autoScrollEl.checked =
-        !!settings.autoScroll;
-    }
-
-
-    if (fontValue) {
-      fontValue.textContent =
-        settings.fontSize + 'px';
-    }
+    settingsPanel.querySelectorAll('input[type="radio"][name="hl"]').forEach(r => {
+      r.checked = r.value === settings.highlightMode;
+    });
+    if (autoScrollEl) autoScrollEl.checked = !!settings.autoScroll;
+    if (fontValue) fontValue.textContent = settings.fontSize + 'px';
   }
-
 
   function applySettings() {
-
-    document.documentElement.style.setProperty(
-      '--textSize',
-      settings.fontSize + 'px'
-    );
-
-
+    document.documentElement.style.setProperty('--textSize', settings.fontSize + 'px');
     saveSettings(settings);
-
     updateSettingsUI();
-
-
-    if (lastState) {
-      render(lastState);
+    
+    // Если проект уже загружен, перерисовываем его с новыми настройками
+    if (currentRender && currentState) {
+      currentRender(currentState);
     }
   }
 
-
-  if (
-    settingsBtn &&
-    settingsPanel
-  ) {
-
+  if (settingsBtn && settingsPanel) {
     settingsBtn.onclick = () => {
-
-      settingsPanel.hidden =
-        !settingsPanel.hidden;
-
-
+      settingsPanel.hidden = !settingsPanel.hidden;
       updateSettingsUI();
     };
-
-
-    document.addEventListener(
-      'mousedown',
-      e => {
-
-        if (settingsPanel.hidden) {
-          return;
-        }
-
-
-        if (
-          settingsPanel.contains(e.target) ||
-          settingsBtn.contains(e.target)
-        ) {
-          return;
-        }
-
-
-        settingsPanel.hidden = true;
-      }
-    );
-
-
-    document.addEventListener(
-      'keydown',
-      e => {
-
-        if (e.key === 'Escape') {
-          settingsPanel.hidden = true;
-        }
-      }
-    );
-
-
-    settingsPanel
-      .querySelectorAll(
-        'input[type="radio"][name="hl"]'
-      )
-      .forEach(r => {
-
-        r.onchange = () => {
-
-          settings.highlightMode =
-            r.value;
-
-          applySettings();
-        };
-      });
+    document.addEventListener('mousedown', e => {
+      if (settingsPanel.hidden) return;
+      if (settingsPanel.contains(e.target) || settingsBtn.contains(e.target)) return;
+      settingsPanel.hidden = true;
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') settingsPanel.hidden = true;
+    });
+    settingsPanel.querySelectorAll('input[type="radio"][name="hl"]').forEach(r => {
+      r.onchange = () => {
+        settings.highlightMode = r.value;
+        applySettings();
+      };
+    });
   }
-
 
   if (fontMinus) {
     fontMinus.onclick = () => {
-
-      settings.fontSize =
-        Math.max(
-          11,
-          settings.fontSize - 1
-        );
-
+      settings.fontSize = Math.max(11, settings.fontSize - 1);
       applySettings();
     };
   }
-
-
   if (fontPlus) {
     fontPlus.onclick = () => {
-
-      settings.fontSize =
-        Math.min(
-          26,
-          settings.fontSize + 1
-        );
-
+      settings.fontSize = Math.min(26, settings.fontSize + 1);
       applySettings();
     };
   }
-
-
   if (autoScrollEl) {
     autoScrollEl.onchange = () => {
-
-      settings.autoScroll =
-        !!autoScrollEl.checked;
-
+      settings.autoScroll = !!autoScrollEl.checked;
       applySettings();
     };
   }
-
 
   updateSettingsUI();
   applySettings();
 
+  // --- ОБРАБОТКА КЛАВИАТУРЫ ---
+  let isContinuousMovement = false;
+  let resetMovementTimer = null;
+  let keyRepeatRaf = null;
 
-  const els = {
-
-    graphSvg:
-      document.getElementById(
-        'graphSvg'
-      ),
-
-    graphNodes:
-      document.getElementById(
-        'graphNodes'
-      ),
-
-    edgeOptions:
-      document.getElementById(
-        'edgeOptions'
-      ),
-
-    edgeProgress:
-      document.getElementById(
-        'edgeProgress'
-      ),
-
-    slider:
-      document.getElementById(
-        'slider'
-      ),
-
-    opsFill:
-      document.getElementById(
-        'opsFill'
-      )
-  };
-
-
-  const edgeLeftLabelEl =
-    document.getElementById(
-      'edgeLeftLabel'
-    );
-
-
-  const edgeRightLabelEl =
-    document.getElementById(
-      'edgeRightLabel'
-    );
-
-
-  let graphMap = null;
-
-
-  function render(st) {
-
-    lastState = st;
-
-
-    const view =
-      st.buildViewState();
-
-
-    drawText(
-      view.tokens,
-      view.exact,
-      view.curOp,
-      settings
-    );
-
-
-    const status =
-      st.getStatusLabel();
-
-
-    const statusEl =
-      document.getElementById(
-        'status'
-      );
-
-
-    if (statusEl) {
-      statusEl.textContent =
-        status.text;
-
-      statusEl.className =
-        status.cls;
-    }
-
-
-    const stepEl =
-      document.getElementById(
-        'stepLabel'
-      );
-
-
-    if (stepEl) {
-      stepEl.textContent = '';
-    }
-
-
-    if (
-      st.mode === 'edge' &&
-      st.currentEdge
-    ) {
-
-      const e =
-        st.currentEdge;
-
-
-      const fromV =
-        graph.versionsById.get(
-          e.from
-        );
-
-
-      const toV =
-        graph.versionsById.get(
-          e.to
-        );
-
-
-      renderEdgeLabel(
-        edgeLeftLabelEl,
-        fromV
-      );
-
-
-      renderEdgeLabel(
-        edgeRightLabelEl,
-        toV
-      );
-
-
-    } else if (
-      st.mode === 'node'
-    ) {
-
-      const curV =
-        graph.versionsById.get(
-          st.nodeId
-        );
-
-
-      renderEdgeLabel(
-        edgeLeftLabelEl,
-        curV
-      );
-
-
-      renderEdgeLabel(
-        edgeRightLabelEl,
-        null
-      );
-    }
-
-
-    graphMap?.update(st);
-
-
-    if (
-      settings.autoScroll &&
-      st.mode === 'edge'
-    ) {
-
-      const key =
-        `${st.edgeKey}:${st.step}:${settings.highlightMode}`;
-
-
-      if (key !== lastAutoKey) {
-
-        lastAutoKey = key;
-
-
-        const focusEl =
-          document.querySelector(
-            '#text .token.focus'
-          );
-
-
-        if (focusEl) {
-          focusEl.scrollIntoView({
-            block: 'center',
-            inline: 'nearest',
-            behavior: 'smooth'
-          });
-        }
-      }
-    }
+  function markContinuousMovement() {
+    isContinuousMovement = true;
+    clearTimeout(resetMovementTimer);
+    resetMovementTimer = setTimeout(() => {
+      isContinuousMovement = false;
+    }, 150);
   }
 
+  document.addEventListener('keydown', e => {
+    if (e.target instanceof HTMLInputElement && e.target.type === 'range') return;
+    if (!currentPlayer) return;
 
-  const player =
-    createEdgePlayer({
-      data,
-      graph,
-      els,
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      if (e.repeat) markContinuousMovement();
 
-      onStateChange:
-        st => render(st)
-    });
-
-
-  graphMap =
-    createGraphMap({
-      data,
-      graph,
-      els,
-
-      onNodeClick: id => {
-
-        if (
-          player.jumpToNodeAtEnd
-        ) {
-
-          player.jumpToNodeAtEnd(id);
-
-        } else {
-
-          player.setPathToNode?.(id);
-          player.goToNode?.(id);
-        }
+      if (!keyRepeatRaf) {
+        keyRepeatRaf = requestAnimationFrame(() => {
+          if (e.key === 'ArrowLeft') currentPlayer.prev();
+          if (e.key === 'ArrowRight') currentPlayer.next();
+          keyRepeatRaf = null;
+        });
       }
-    });
+    }
+  });
 
-
-  graphMap.update(
-    player.getState()
-  );
-
-
+  // Инициализация статических плагинов интерфейса
   setupMobileGraphToggle();
   setupGraphZoomAndPan();
   setupInstantTooltip();
 
 
-  document.getElementById(
-    'prev'
-  ).onclick = () =>
-    player.prev();
+  // --- ФУНКЦИЯ ЗАГРУЗКИ КОНКРЕТНОГО ПРОЕКТА ---
+  function loadProject(data) {
+    // 1. Обновляем заголовки
+    document.getElementById('title').textContent = data.meta?.work || 'Без названия';
+    document.getElementById('part').textContent = data.meta?.part || '';
+    document.getElementById('srcNote').textContent = data.meta?.src || '';
+    document.getElementById('methodNote').textContent = data.meta?.note || '';
+    document.getElementById('projectName').textContent = data.meta?.work || 'Без названия';
+    document.getElementById('partName').textContent = data.meta?.part || '';
 
+    const graph = buildGraphIndex(data);
+    let lastAutoKey = null;
 
-  document.getElementById(
-    'next'
-  ).onclick = () =>
-    player.next();
+    const els = {
+      graphSvg: document.getElementById('graphSvg'),
+      graphNodes: document.getElementById('graphNodes'),
+      edgeOptions: document.getElementById('edgeOptions'),
+      edgeProgress: document.getElementById('edgeProgress'),
+      slider: document.getElementById('slider'),
+      opsFill: document.getElementById('opsFill')
+    };
 
+    const transLabelEl = document.getElementById('transitionLabel');
 
-  document.getElementById(
-    'slider'
-  ).oninput = e =>
-    player.setStep(
-      e.target.value
-    );
+    // 2. Создаем функцию рендера для этого проекта
+    currentRender = function render(st) {
+      currentState = st;
+      const view = st.buildViewState();
 
+      drawText(view.tokens, view.exact, view.curOp, settings);
 
-  document.addEventListener(
-    'keydown',
-    e => {
+      const status = st.getStatusLabel();
+      const statusEl = document.getElementById('status');
+      if (statusEl) {
+        statusEl.textContent = status.text;
+        statusEl.className = status.cls;
+      }
 
-      if (
-        e.target instanceof HTMLInputElement &&
-        e.target.type === 'range'
-      ) {
+      const stepEl = document.getElementById('stepLabel');
+      if (stepEl) stepEl.textContent = '';
+
+      if (transLabelEl) {
+        if (st.mode === 'node') {
+          const curV = graph.versionsById.get(st.nodeId);
+          transLabelEl.innerHTML = buildPillHTML(curV);
+        } else if (st.mode === 'edge' && st.currentEdge) {
+          const e = st.currentEdge;
+          const fromV = graph.versionsById.get(e.from);
+          const toV = graph.versionsById.get(e.to);
+          const maxStep = (e.ops?.length ?? 0) + 1;
+
+          if (st.step === 0) {
+            transLabelEl.innerHTML = buildPillHTML(fromV);
+          } else if (st.step >= maxStep) {
+            transLabelEl.innerHTML = buildPillHTML(toV);
+          } else {
+            transLabelEl.innerHTML = `${buildPillHTML(fromV)} <span class="transition-arrow">→</span> ${buildPillHTML(toV)}`;
+          }
+        }
+      }
+
+      graphMap?.update(st);
+
+      if (settings.autoScroll && st.mode === 'edge') {
+        const key = `${st.edgeKey}:${st.step}:${settings.highlightMode}`;
+        if (key !== lastAutoKey) {
+          lastAutoKey = key;
+          const focusEl = document.querySelector('#text .token.focus');
+          if (focusEl) {
+            smartScrollToToken(focusEl, !isContinuousMovement);
+          }
+        }
+      }
+    };
+
+    // 3. Создаем новые сущности графа и плеера
+    currentPlayer = createEdgePlayer({
+      data,
+      graph,
+      els,
+      onStateChange: st => currentRender(st)
+    });
+
+    graphMap = createGraphMap({
+      data,
+      graph,
+      els,
+      onNodeClick: id => {
+        if (currentPlayer.jumpToNodeAtEnd) {
+          currentPlayer.jumpToNodeAtEnd(id);
+        } else {
+          currentPlayer.setPathToNode?.(id);
+          currentPlayer.goToNode?.(id);
+        }
+      }
+    });
+
+    graphMap.update(currentPlayer.getState());
+
+    // 4. Привязываем кнопки именно к текущему плееру (перезаписываем старые)
+    document.getElementById('prev').onclick = () => {
+      isContinuousMovement = false;
+      currentPlayer.prev();
+    };
+
+    document.getElementById('next').onclick = () => {
+      isContinuousMovement = false;
+      currentPlayer.next();
+    };
+
+    document.getElementById('slider').oninput = e => {
+      markContinuousMovement();
+      currentPlayer.setStep(e.target.value);
+    };
+  }
+
+  // --- ОБРАБОТЧИК ЗАГРУЗКИ КАСТОМНОГО ФАЙЛА ---
+  const fileInput = document.getElementById('tdjFileInput');
+  const loadBtn = document.getElementById('loadTdjBtn');
+  
+  if (!fileInput || !loadBtn) {
+    console.error('❌ ВНИМАНИЕ: Не найдены элементы для загрузки файла (tdjFileInput или loadTdjBtn)');
+  } else {
+    // 1. По клику на красивую кнопку симулируем клик по скрытому инпуту
+    loadBtn.addEventListener('click', () => {
+      fileInput.click();
+    });
+
+    // 2. Слушаем реальное изменение файла
+    fileInput.addEventListener('change', async (e) => {
+      console.log('✅ Файл выбран, начинаем обработку...');
+      
+      const file = e.target.files[0];
+      if (!file) {
+        console.log('❌ Файл не был передан браузером');
         return;
       }
 
+      try {
+        // Показываем экран загрузки
+        document.getElementById('text').innerHTML = '<div style="padding: 60px 20px; text-align: center; color: #888; font-size: 18px;">Собираем граф и тексты...</div>';
+        document.getElementById('title').textContent = 'Загрузка...';
+        document.getElementById('part').textContent = '';
+        
+        const svgEl = document.getElementById('graphSvg');
+        const nodesEl = document.getElementById('graphNodes');
+        if (svgEl) svgEl.innerHTML = '';
+        if (nodesEl) nodesEl.innerHTML = '';
 
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault();
+        // Читаем файл
+        const text = await file.text();
+        const data = JSON.parse(text);
 
-        player.prev();
+        if (!data.meta || !data.versions || !Array.isArray(data.versions)) {
+          throw new Error('Файл не похож на TDJ-проект (нет meta или versions)');
+        }
+
+        // Рендерим новый граф с небольшой задержкой для перерисовки DOM
+        setTimeout(() => {
+          try {
+            loadProject(data);
+            window.scrollTo({ top: 0, behavior: 'auto' });
+            console.log('✅ Новый проект успешно загружен!');
+          } catch (projectErr) {
+            alert('Ошибка при построении графа:\n' + projectErr.message);
+            console.error(projectErr);
+          }
+        }, 50);
+
+      } catch (err) {
+        alert('Ошибка при загрузке или чтении файла:\n' + err.message);
+        console.error(err);
+        // Восстанавливаем прошлый стейт при ошибке
+        if (currentRender && currentState) {
+          currentRender(currentState);
+        }
+      } finally {
+        // Сбрасываем input, чтобы событие change сработало, даже если выбрать тот же файл еще раз
+        e.target.value = ''; 
       }
+    });
+  }
 
-
-      if (e.key === 'ArrowRight') {
-        e.preventDefault();
-
-        player.next();
-      }
-    }
-  );
+  // --- ЗАГРУЗКА ФАЙЛА ПО УМОЛЧАНИЮ ---
+  try {
+    const data = window.TXTS_INLINE 
+      ? window.TXTS_INLINE 
+      : await (await fetch('./tdj-text.json')).json();
+    loadProject(data);
+  } catch (err) {
+    console.error("Не удалось загрузить базовый текст:", err);
+    document.getElementById('title').textContent = 'Ошибка загрузки базового файла';
+  }
 }
 
-
-load();
+// Запускаем приложение
+boot();
